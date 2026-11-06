@@ -29,8 +29,10 @@ from zerotts.chunking import normalize_punctuation
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "tts-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+LOCAL_MODEL_DIR = Path(__file__).resolve().parent / "models" / "zerotts"
 LOCAL_MODEL_CANDIDATES = [
     os.environ.get("ZEROTTS_MODEL_PATH", ""),
+    str(LOCAL_MODEL_DIR),
 ]
 
 # Chỉ giữ lại chữ cái tiếng Việt (Latin + dấu tiếng Việt), chữ số và dấu câu cơ bản
@@ -47,7 +49,11 @@ def resolve_model_source() -> str:
     for candidate in LOCAL_MODEL_CANDIDATES:
         if candidate and os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "config.json")):
             return candidate
-    return "zeroweight-ai/ZeroTTS"
+    # onnxruntime >= 1.2x từ chối nạp model từ cache HuggingFace (file .data là symlink trỏ ra
+    # ~/.cache/.../blobs → "External data path escapes model directory"). Tải về thư mục thật.
+    from huggingface_hub import snapshot_download
+    snapshot_download("zeroweight-ai/ZeroTTS", local_dir=str(LOCAL_MODEL_DIR))
+    return str(LOCAL_MODEL_DIR)
 
 
 def emit(payload: dict) -> None:

@@ -720,7 +720,9 @@ import { dispatchGiftSfx } from './gift-sfx-dispatcher.js';
             });
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        console.error('[WS] Lỗi xử lý tin nhắn:', err);
+      }
     };
 
     ws.onclose = () => {

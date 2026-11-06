@@ -7,8 +7,16 @@ const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { TikTokLiveConnection, WebcastEvent, ControlEvent } = require('tiktok-live-connector');
 const { normalizeGiftPayload, getGiftComboDelta } = require('./lib/tiktok-gift-payload.cjs');
+const { detectCommentIntent } = require('./lib/comment-intent.cjs');
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+// Mặc định chỉ nghe trên máy này (OBS chạy cùng máy). Muốn mở cho máy khác trong LAN: HOST=0.0.0.0
+const HOST = process.env.HOST || '127.0.0.1';
+// Nếu đặt ADMIN_TOKEN thì các lệnh quản trị (reset, cài đặt, kết nối live, đọc TTS tuỳ ý) phải kèm token
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const MAX_DEVOTEES = Number(process.env.MAX_DEVOTEES) || 3000;
+const TTS_CACHE_MAX_FILES = Number(process.env.TTS_CACHE_MAX_FILES) || 2000;
+const TTS_CACHE_MAX_AGE_DAYS = Number(process.env.TTS_CACHE_MAX_AGE_DAYS) || 14;
 const DATA_DIR = path.join(__dirname, 'data');
 const TTS_CACHE_DIR = path.join(DATA_DIR, 'tts-cache');
 const STATE_FILE = path.join(DATA_DIR, 'merit-state.json');
@@ -274,7 +282,7 @@ const DEFAULT_STATE = {
   tiktok: {
     connected: false,
     connecting: false,
-    username: 'zenfacts_vn',
+    username: '',
     roomId: null,
     viewerCount: 0,
     lastError: null
@@ -291,7 +299,7 @@ function loadState() {
         devotees: saved.devotees || {},
         offerings: { ...DEFAULT_STATE.offerings, ...(saved.offerings || {}) },
         settings: { ...DEFAULT_STATE.settings, ...(saved.settings || {}) },
-        tiktok: { ...DEFAULT_STATE.tiktok }
+        tiktok: { ...DEFAULT_STATE.tiktok, username: saved.lastTikTokUser || '' }
       };
     }
   } catch (e) {
@@ -316,12 +324,45 @@ function saveState() {
       activeIncenseSticks: state.activeIncenseSticks,
       offerings: state.offerings,
       devotees: state.devotees,
-      settings: state.settings
+      settings: state.settings,
+      lastTikTokUser: state.tiktok?.username || ''
     };
     fs.promises.writeFile(STATE_FILE, JSON.stringify(toSave, null, 2), 'utf8').catch((e) => {
       console.error('[State] Lỗi lưu file:', e.message);
     });
   }, 1200);
+}
+
+function flushStateSync() {
+  clearTimeout(saveTimer);
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      totalIncense: state.totalIncense,
+      totalMerit: state.totalMerit,
+      woodenFishHits: state.woodenFishHits,
+      bellRings: state.bellRings,
+      lanternCount: state.lanternCount,
+      fortuneCount: state.fortuneCount,
+      activeIncenseSticks: state.activeIncenseSticks,
+      offerings: state.offerings,
+      devotees: state.devotees,
+      settings: state.settings,
+      lastTikTokUser: state.tiktok?.username || ''
+    }, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[State] Lỗi lưu file khi tắt:', e.message);
+  }
+}
+
+// Mỗi người vào phòng đều được ghi lại → sau vài buổi live file trạng thái phình hàng chục nghìn
+// mục và mỗi sự kiện phải sắp xếp lại toàn bộ. Giữ MAX_DEVOTEES người có công đức cao nhất.
+function pruneDevotees() {
+  const keys = Object.keys(state.devotees);
+  if (keys.length <= MAX_DEVOTEES * 1.1) return;
+  keys
+    .sort((a, b) => state.devotees[b].merit - state.devotees[a].merit)
+    .slice(MAX_DEVOTEES)
+    .forEach((k) => delete state.devotees[k]);
 }
 
 function getLeaderboard(limit = 6) {
@@ -418,6 +459,7 @@ function recordDevotee(user, uniqueId, avatar, meritDelta, incenseDelta = 0, gif
   if (cleanWish) dev.lastWish = cleanWish;
 
   state.totalMerit += meritDelta;
+  pruneDevotees();
   state.haloIntensity = Math.min(1.0, 0.35 + (state.totalMerit % 1000) / 1400);
   return dev;
 }
@@ -593,15 +635,15 @@ const Rituals = {
       lamp: 'Đèn Lưu Ly Trí Tuệ',
       dragon: 'Đại Lễ Kim Long Chầu Phật'
     };
-    const giftName = params.giftName || giftLabels[giftType];
-    const multiplier = coins >= 100 ? 50 : coins >= 10 ? 30 : 20;
+    const giftName = String(params.giftName || giftLabels[giftType]).slice(0, 60);
+    const multiplier = coins >= 100 ? 50 : coins >= 5 ? 30 : 20;
     const merit = Math.max(20, coins * multiplier);
 
     state.offerings[giftType] = (state.offerings[giftType] || 0) + 1;
     state.totalIncense += 3;
     state.activeIncenseSticks = Math.min(36, state.activeIncenseSticks + 3);
 
-    const wish = params.wish || `Dâng cúng ${giftName} lên Tam Bảo`;
+    const wish = sanitizeWishText(params.wish) || `Dâng cúng ${giftName} lên Tam Bảo`;
     const devotee = recordDevotee(user, uniqueId, avatar, merit, 3, 1, wish);
 
     const ttsText = params.readTts === false
@@ -675,12 +717,22 @@ const Rituals = {
   },
 
   updateSettings(params = {}) {
-    state.settings = {
-      ...state.settings,
-      ...params
-    };
-    if (typeof params.autoSim === 'boolean') {
-      configureAutoSim(params.autoSim);
+    const clean = {};
+    for (const key of ['ttsEnabled', 'bgMusicEnabled', 'sfxEnabled', 'autoSim']) {
+      if (typeof params[key] === 'boolean') clean[key] = params[key];
+    }
+    for (const [key, min, max] of [
+      ['musicVolume', 0, 1], ['ttsVolume', 0, 1], ['smokeDensity', 0, 3], ['autoSimIntervalMs', 2000, 600000]
+    ]) {
+      const n = Number(params[key]);
+      if (params[key] != null && Number.isFinite(n)) clean[key] = Math.min(max, Math.max(min, n));
+    }
+    if (typeof params.ttsVoice === 'string' && /^[a-z0-9_-]{1,32}$/i.test(params.ttsVoice)) {
+      clean.ttsVoice = params.ttsVoice.toLowerCase();
+    }
+    state.settings = { ...state.settings, ...clean };
+    if (typeof clean.autoSim === 'boolean' || clean.autoSimIntervalMs != null) {
+      configureAutoSim(state.settings.autoSim);
     }
     saveState();
     broadcastNotification('temple.state', getPublicState());
@@ -730,6 +782,7 @@ function parseViewerComment(commentText, user, uniqueId, avatar) {
     if (now - lastTs < 3500) {
       return null;
     }
+    commentCooldownMap.delete(userKey);
     commentCooldownMap.set(userKey, now);
     if (commentCooldownMap.size > 600) {
       const oldestKey = commentCooldownMap.keys().next().value;
@@ -738,69 +791,42 @@ function parseViewerComment(commentText, user, uniqueId, avatar) {
   }
 
   const cleanUser = sanitizeUserName(user);
-  const lower = cleanWish.toLowerCase();
-
-  // 1. Xin xăm / Gieo quẻ
-  if (
-    lower.includes('xin xăm') ||
-    lower.includes('xin xam') ||
-    lower.includes('gieo quẻ') ||
-    lower.includes('gieo que') ||
-    lower.includes('rút quẻ') ||
-    lower.includes('rut que') ||
-    lower.includes('quẻ') ||
-    lower.includes('que')
-  ) {
-    return Rituals.drawFortune({ user: cleanUser, uniqueId, avatar, topic: cleanWish });
-  }
-
-  // 2. Thỉnh chuông
-  if (lower.includes('chuông') || lower.includes('chuong') || lower.includes('thỉnh chuông')) {
-    return Rituals.ringBell({ user: cleanUser, uniqueId, avatar, count: 1, wish: cleanWish, readTts: true });
-  }
-
-  // 3. Gõ mõ
-  if (lower.includes('gõ mõ') || lower.includes('go mo') || lower.includes('tụng kinh')) {
-    return Rituals.strikeWoodenFish({ user: cleanUser, uniqueId, avatar, count: 3 });
-  }
-
-  // 4. Thắp hương / Bái Phật
-  if (
-    lower.includes('thắp hương') ||
-    lower.includes('thap huong') ||
-    lower.includes('dâng hương') ||
-    lower.includes('dang huong') ||
-    lower.includes('bái phật') ||
-    lower.includes('bai phat') ||
-    lower.includes('lạy phật') ||
-    lower.includes('lay phat')
-  ) {
-    return Rituals.burnIncense({ user: cleanUser, uniqueId, avatar, count: 3, wish: cleanWish });
-  }
-
-  // 5. Cầu nguyện / Thả đèn hoa đăng
-  if (
-    lower.includes('cầu') ||
-    lower.includes('cau ') ||
-    lower.includes('nguyện') ||
-    lower.includes('nguyen') ||
-    lower.includes('nam mô') ||
-    lower.includes('nam mo') ||
-    lower.includes('mô phật') ||
-    lower.includes('mo phat') ||
-    lower.includes('a di đà') ||
-    lower.includes('a di da') ||
-    lower.includes('bình an') ||
-    lower.includes('tài lộc') ||
-    lower.includes('chúc')
-  ) {
-    return Rituals.sendPrayer({ user: cleanUser, uniqueId, avatar, wish: cleanWish });
+  switch (detectCommentIntent(cleanWish)) {
+    case 'fortune':
+      return Rituals.drawFortune({ user: cleanUser, uniqueId, avatar, topic: cleanWish });
+    case 'bell':
+      return Rituals.ringBell({ user: cleanUser, uniqueId, avatar, count: 1, wish: cleanWish, readTts: true });
+    case 'woodenFish':
+      return Rituals.strikeWoodenFish({ user: cleanUser, uniqueId, avatar, count: 3 });
+    case 'incense':
+      return Rituals.burnIncense({ user: cleanUser, uniqueId, avatar, count: 3, wish: cleanWish });
+    case 'prayer':
+      return Rituals.sendPrayer({ user: cleanUser, uniqueId, avatar, wish: cleanWish });
+    default:
+      break;
   }
 
   return Rituals.burnIncense({ user: cleanUser, uniqueId, avatar, count: 1, wish: cleanWish });
 }
 
 const giftComboTracker = new Map();
+
+// Tự nối lại khi phòng live rớt (mạng chập chờn, TikTok đá kết nối). Ngắt tay thì không nối lại.
+const reconnect = { wanted: false, attempts: 0, timer: null };
+function scheduleReconnect(username) {
+  if (!reconnect.wanted || reconnect.timer) return;
+  reconnect.attempts += 1;
+  const delay = Math.min(60000, 5000 * 2 ** Math.min(reconnect.attempts - 1, 4));
+  console.log(`[TikTok Live] Thử nối lại @${username} sau ${delay / 1000}s (lần ${reconnect.attempts})`);
+  reconnect.timer = setTimeout(() => {
+    reconnect.timer = null;
+    if (!reconnect.wanted) return;
+    connectTikTokLive(username, { fromReconnect: true }).catch((err) => {
+      console.warn('[TikTok Live] Nối lại thất bại:', err.message);
+      scheduleReconnect(username);
+    });
+  }, delay);
+}
 
 async function resolveTikTokUsername(rawInput) {
   let input = String(rawInput || '').trim();
@@ -841,11 +867,17 @@ function extractUserFromEvent(data) {
   return { user, uniqueId, avatar };
 }
 
-async function connectTikTokLive(usernameOrUrl) {
+async function connectTikTokLive(usernameOrUrl, { fromReconnect = false } = {}) {
   const cleanUser = await resolveTikTokUsername(usernameOrUrl);
   if (!cleanUser) {
     throw new Error('Không tìm thấy @username hợp lệ từ dữ liệu nhập vào');
   }
+  if (!fromReconnect) {
+    clearTimeout(reconnect.timer);
+    reconnect.timer = null;
+    reconnect.attempts = 0;
+  }
+  reconnect.wanted = true;
 
   if (tiktokConn) {
     try {
@@ -882,6 +914,8 @@ async function connectTikTokLive(usernameOrUrl) {
     state.tiktok.connecting = false;
     state.tiktok.roomId = roomState?.roomId || tiktokConn?.roomId || null;
     state.tiktok.lastError = null;
+    reconnect.attempts = 0;
+    saveState();
     console.log(`[TikTok Live] Đã kết nối phòng @${cleanUser} (roomId: ${state.tiktok.roomId})`);
     broadcastNotification('temple.state', getPublicState());
   });
@@ -893,11 +927,18 @@ async function connectTikTokLive(usernameOrUrl) {
     state.tiktok.connecting = false;
     console.log(`[TikTok Live] Đã ngắt kết nối @${cleanUser}`);
     broadcastNotification('temple.state', getPublicState());
+    scheduleReconnect(cleanUser);
+  });
+
+  connection.on(WebcastEvent.STREAM_END, () => {
+    if (!isCurrentConnection()) return;
+    console.log(`[TikTok Live] @${cleanUser} đã kết thúc live, sẽ chờ phiên mới`);
   });
 
   connection.on(ControlEvent.ERROR, (err) => {
     if (!isCurrentConnection()) return;
-    state.tiktok.lastError = err?.message || String(err);
+    state.tiktok.lastError = err?.message || err?.exception?.message || err?.info
+      || (typeof err === 'object' ? JSON.stringify(err).slice(0, 200) : String(err));
     console.warn('[TikTok Live Warning]', state.tiktok.lastError);
     broadcastNotification('temple.state', getPublicState());
   });
@@ -915,7 +956,8 @@ async function connectTikTokLive(usernameOrUrl) {
     if (!isCurrentConnection()) return;
     const { user, uniqueId, avatar } = extractUserFromEvent(data);
     recordDevotee(user, uniqueId, avatar, 1, 0, 0, 'Đã vào Chánh Điện lễ Phật');
-    broadcastNotification('temple.state', getPublicState());
+    saveState();
+    scheduleStateBroadcast();
   });
 
   connection.on(WebcastEvent.CHAT, (data) => {
@@ -1023,11 +1065,16 @@ async function connectTikTokLive(usernameOrUrl) {
       state.tiktok.lastError = message;
       broadcastNotification('temple.state', getPublicState());
     }
+    // Lần kết nối đầu do người dùng bấm thì báo lỗi ngay, không lặp lại vô hạn khi kênh chưa live
+    if (!fromReconnect) reconnect.wanted = false;
     throw new Error(message);
   }
 }
 
 function disconnectTikTokLive() {
+  reconnect.wanted = false;
+  clearTimeout(reconnect.timer);
+  reconnect.timer = null;
   if (tiktokConn) {
     try {
       tiktokConn.disconnect();
@@ -1086,7 +1133,15 @@ function configureAutoSim(enabled) {
 // ============================================================================
 // 7. JSON-RPC 2.0 DISPATCHER
 // ============================================================================
-async function handleRpcCall(method, params = {}) {
+const ADMIN_METHODS = new Set([
+  'temple.updateSettings', 'temple.resetMerit', 'temple.speak',
+  'live.connect', 'live.disconnect', 'live.setAutoSim'
+]);
+
+async function handleRpcCall(method, params = {}, token = '') {
+  if (ADMIN_TOKEN && ADMIN_METHODS.has(method) && token !== ADMIN_TOKEN) {
+    throw new Error(`Phương thức ${method} cần ADMIN_TOKEN`);
+  }
   switch (method) {
     case 'temple.getState':
       return getPublicState();
@@ -1161,7 +1216,8 @@ app.post('/rpc', async (req, res) => {
     });
   }
   try {
-    const result = await handleRpcCall(method, params || {});
+    const token = req.get('x-admin-token') || req.query.token || '';
+    const result = await handleRpcCall(method, params || {}, token);
     res.json({
       jsonrpc: jsonrpc || '2.0',
       id: id ?? null,
@@ -1182,6 +1238,9 @@ app.all('/api/tts', async (req, res) => {
   const voice = (req.body?.voice || req.query?.voice || state.settings.ttsVoice || 'maichi').trim();
   if (!text) {
     return res.status(400).json({ ok: false, error: 'Thiếu nội dung text cần đọc' });
+  }
+  if (ADMIN_TOKEN && (req.get('x-admin-token') || req.query.token) !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: 'Cần ADMIN_TOKEN' });
   }
   const result = await zeroTts.synthesize(text, voice);
   res.json(result);
@@ -1207,7 +1266,17 @@ function broadcastNotification(method, params) {
   }
 }
 
-wss.on('connection', (ws) => {
+let stateBroadcastTimer = null;
+function scheduleStateBroadcast() {
+  if (stateBroadcastTimer) return;
+  stateBroadcastTimer = setTimeout(() => {
+    stateBroadcastTimer = null;
+    broadcastNotification('temple.state', getPublicState());
+  }, 1000);
+}
+
+wss.on('connection', (ws, req) => {
+  const wsToken = new URL(req.url, 'http://x').searchParams.get('token') || '';
   ws.send(
     JSON.stringify({
       jsonrpc: '2.0',
@@ -1225,7 +1294,7 @@ wss.on('connection', (ws) => {
     }
     if (!msg || !msg.method) return;
     try {
-      const result = await handleRpcCall(msg.method, msg.params || {});
+      const result = await handleRpcCall(msg.method, msg.params || {}, msg.token || wsToken);
       if (msg.id !== undefined) {
         ws.send(
           JSON.stringify({
@@ -1251,21 +1320,61 @@ wss.on('connection', (ws) => {
 
 const zeroTts = new ZeroTTSManager();
 
-server.listen(PORT, () => {
+// Mỗi câu đọc mới sinh một file WAV; không dọn thì sau vài tuần live thư mục lên nhiều GB.
+function pruneTtsCache() {
+  try {
+    const cutoff = Date.now() - TTS_CACHE_MAX_AGE_DAYS * 86400000;
+    const files = fs.readdirSync(TTS_CACHE_DIR)
+      .filter((f) => f.endsWith('.wav'))
+      .map((f) => {
+        const full = path.join(TTS_CACHE_DIR, f);
+        return { full, mtime: fs.statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    let removed = 0;
+    files.forEach((f, i) => {
+      if (i >= TTS_CACHE_MAX_FILES || f.mtime < cutoff) {
+        fs.unlinkSync(f.full);
+        removed += 1;
+      }
+    });
+    if (removed) console.log(`[TTS Cache] Đã dọn ${removed} file cũ, còn ${files.length - removed}`);
+  } catch (e) {
+    console.warn('[TTS Cache] Lỗi dọn cache:', e.message);
+  }
+}
+pruneTtsCache();
+setInterval(pruneTtsCache, 3600000).unref();
+
+function shutdown(signal) {
+  console.log(`[Server] Nhận ${signal}, lưu trạng thái và tắt...`);
+  flushStateSync();
+  try { zeroTts.proc?.kill(); } catch (_) {}
+  try { tiktokConn?.disconnect(); } catch (_) {}
+  process.exit(0);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+server.listen(PORT, HOST, () => {
   console.log(`============================================================`);
   console.log(`🪷 CHÙA ONLINE TIKTOK LIVE RPC ĐÃ KHỞI ĐỘNG`);
   console.log(`📺 Màn hình Live (9:16 OBS): http://localhost:${PORT}`);
   console.log(`🎛️ Bảng điều khiển RPC Admin: http://localhost:${PORT}/admin`);
   console.log(`🔌 JSON-RPC 2.0 Endpoint   : http://localhost:${PORT}/rpc (ws://localhost:${PORT}/ws)`);
+  console.log(`🔒 Nghe trên ${HOST}${ADMIN_TOKEN ? ' · lệnh quản trị cần ADMIN_TOKEN' : ''}`);
   console.log(`============================================================`);
 
   // Visual/browser audits can opt out of external live connections.
   if (process.env.DISABLE_TIKTOK_AUTOCONNECT !== '1') {
-    // Tự động kết nối tới @zenfacts_vn ngay khi khởi động server
-    const defaultChannel = process.env.TIKTOK_USER || state.tiktok?.username || 'zenfacts_vn';
+    // Tự kết nối kênh trong TIKTOK_USER, hoặc kênh đã kết nối thành công lần trước
+    const defaultChannel = process.env.TIKTOK_USER || state.tiktok?.username || '';
     if (defaultChannel) {
       connectTikTokLive(defaultChannel).catch((err) => {
         console.warn(`[Auto-Connect @${defaultChannel}] Chưa kết nối được ngay:`, err.message);
+        // Kênh chưa lên live lúc bật máy → cứ chờ, tối đa 60s thử lại một lần
+        reconnect.wanted = true;
+        scheduleReconnect(defaultChannel);
       });
     }
   }

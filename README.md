@@ -66,6 +66,22 @@ bun start
 bun run dev
 ```
 
+### 4. Biến môi trường
+
+| Biến | Mặc định | Ý nghĩa |
+| :--- | :--- | :--- |
+| `PORT` | `3000` | Cổng server |
+| `HOST` | `127.0.0.1` | Chỉ máy này truy cập được. Đặt `0.0.0.0` để điều khiển từ điện thoại/máy khác trong LAN |
+| `TIKTOK_USER` | *(trống)* | Kênh tự kết nối khi bật. Bỏ trống thì dùng kênh kết nối thành công lần trước; kênh chưa live thì tự chờ và thử lại (5s → tối đa 60s) |
+| `ADMIN_TOKEN` | *(trống)* | Nếu đặt, các lệnh `updateSettings`, `resetMerit`, `speak`, `live.*` phải kèm token: header `X-Admin-Token`, hoặc mở trang với `?token=...` |
+| `MAX_DEVOTEES` | `3000` | Số Phật tử giữ lại trong Bảng Vàng (cắt bớt người công đức thấp) |
+| `TTS_CACHE_MAX_FILES` / `TTS_CACHE_MAX_AGE_DAYS` | `2000` / `14` | Tự dọn file WAV cũ trong `data/tts-cache` mỗi giờ |
+
+```bash
+HOST=0.0.0.0 ADMIN_TOKEN=matkhau TIKTOK_USER=@kenh_cua_ban bun start
+# Điều khiển từ điện thoại: http://<ip-máy>:3000/admin?token=matkhau
+```
+
 Mặc định server chạy tại cổng `3000`:
 - **Màn hình Live + Điều khiển nhanh**: [http://localhost:3000](http://localhost:3000)
 - **Màn hình OBS Browser Source (Sạch 9:16)**: [http://localhost:3000/?obs=1](http://localhost:3000/?obs=1) *(Đặt kích thước Browser Source trong OBS là `1080 × 1920`)*
@@ -81,7 +97,7 @@ Mặc định server chạy tại cổng `3000`:
 | **Follow / Share** | Theo dõi hoặc chia sẻ | Thỉnh Đại Hồng Chung ngân vang + Sóng âm vàng | `+10` |
 | **Bình luận Thắp hương** | `thắp hương`, `dâng hương`, `bái phật`, `lạy phật` | Phật tử bước dọc thảm đỏ lên trước Lư Hương, quỳ đảnh lễ 3 lạy + Đọc tên khấn | `+15` |
 | **Bình luận Cầu nguyện** | `cầu ...`, `nguyện ...`, `nam mô`, `a di đà phật`, `bình an`, `chúc ...` | Bước lên đảnh lễ + Thả Đèn Hoa Đăng mang lời khấn bay lên trời + Đọc lời cầu nguyện | `+10` |
-| **Bình luận Xin xăm** | `xin xăm`, `gieo quẻ`, `rút quẻ`, `quẻ` | Lắc ống xăm + Mở tờ Giải Quẻ đồng bộ đúng lúc giọng đọc bắt đầu vang lên | `+10` |
+| **Bình luận Xin xăm** | `xin xăm`, `gieo quẻ`, `rút quẻ`, `quẻ` (khớp nguyên từ, gõ không dấu cũng nhận) | Lắc ống xăm + Mở tờ Giải Quẻ đồng bộ đúng lúc giọng đọc bắt đầu vang lên | `+10` |
 | **Tặng quà Nhỏ (1–4 xu)** | Hoa hồng (Rose), Heart Me... | Bước lên dâng Đài Hoa Sen Vàng + Thắp 3 nén hương + Đọc lời cảm tạ | `+20` / xu |
 | **Tặng quà Vừa (5–99 xu)** | Đèn lưu ly, Mâm ngũ quả... | Dâng Đèn Lưu Ly / Mâm Ngũ Quả + Thỉnh Chuông + Đọc lời chúc phúc | `+30` / xu |
 | **Tặng quà Lớn (≥ 100 xu)** | Quà ≥ 100 xu | **Đại Lễ Kim Long Chầu Phật**: Mưa hoa sen vàng, Hào quang vạn trượng, Chuông đồng ngân vang | `+50` / xu |

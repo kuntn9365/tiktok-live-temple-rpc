@@ -359,6 +359,9 @@ import { dispatchGiftSfx } from './gift-sfx-dispatcher.js';
   function updateUIState(st) {
     if (!st) return;
 
+    const ttInput = document.getElementById('inputTikTokUser');
+    if (ttInput && !ttInput.value && st.tiktok?.username) ttInput.value = `@${st.tiktok.username}`;
+
     document.getElementById('statIncense').textContent = Number(st.totalIncense || 0).toLocaleString('vi-VN');
     document.getElementById('statMerit').textContent = Number(st.totalMerit || 0).toLocaleString('vi-VN');
     document.getElementById('statWoodenFish').textContent = Number(st.woodenFishHits || 0).toLocaleString('vi-VN');
@@ -690,7 +693,9 @@ import { dispatchGiftSfx } from './gift-sfx-dispatcher.js';
 
   function connectWebSocket() {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+    const adminToken = new URLSearchParams(window.location.search).get('token') || '';
+    const tokenQuery = adminToken ? `?token=${encodeURIComponent(adminToken)}` : '';
+    ws = new WebSocket(`${proto}//${window.location.host}/ws${tokenQuery}`);
 
     ws.onmessage = (event) => {
       try {
@@ -738,7 +743,10 @@ import { dispatchGiftSfx } from './gift-sfx-dispatcher.js';
     }
     const res = await fetch('/rpc', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Token': new URLSearchParams(window.location.search).get('token') || ''
+      },
       body: JSON.stringify(payload)
     });
     const data = await res.json();
